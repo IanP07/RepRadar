@@ -7,6 +7,10 @@ import { Pose, POSE_CONNECTIONS } from "@mediapipe/pose";
 import * as drawingUtils from "@mediapipe/drawing_utils";
 import { Cookies } from 'react-cookie'
 
+const SOCKET_URL =
+  (import.meta as any)?.env?.VITE_SOCKET_URL ||
+  "https://shameka-unbridgeable-noncausally.ngrok-free.dev/";
+
 interface CameraViewProps {
   exercise: Exercise;
   onStop: (results: WorkoutResults) => void;
@@ -155,7 +159,7 @@ export default function CameraView({ exercise, onStop }: CameraViewProps) {
     if (!cameraEnabled) return;
 
     const socket = io(
-      "https://shameka-unbridgeable-noncausally.ngrok-free.dev/",
+      SOCKET_URL,
       {
         transports: ["websocket"],
       }

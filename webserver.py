@@ -5,14 +5,58 @@ from flask import Flask, request
 from flask_socketio import SocketIO, emit
 import mediapipe as mp
 from state_manager import StateManager
+from datetime import datetime, timezone, timedelta
+import threading
+import time
 
 # -----------------------------
 # Flask + SocketIO
 # -----------------------------
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 state_manager = StateManager()
+
+STALE_TIMEOUT_SECONDS = 10
+STALE_CHECK_INTERVAL_SECONDS = 5
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def record_rep_event(state, exercise, rep_count, score, feedback=None):
+    """Store a timestamped record for each completed rep."""
+    timestamp = utc_now().isoformat()
+    state.setdefault("rep_events", []).append({
+        "rep": rep_count,
+        "score": int(score),
+        "exercise": exercise,
+        "timestamp": timestamp,
+        "feedback": feedback,
+    })
+    return timestamp
+
+
+def _start_stale_client_monitor():
+    def monitor():
+        while True:
+            time.sleep(STALE_CHECK_INTERVAL_SECONDS)
+            now = utc_now()
+            stale_sids = []
+            for sid, state in list(state_manager.states.items()):
+                last_seen = state.get("last_seen")
+                if last_seen and (now - last_seen) > timedelta(seconds=STALE_TIMEOUT_SECONDS):
+                    stale_sids.append((sid, last_seen))
+            for sid, last_seen in stale_sids:
+                state_manager.update_state(sid, {"disconnect_time": now})
+                state_manager.remove_state(sid)
+                print(f"[STALE DISCONNECT] User {sid} cleaned up at {now.isoformat()} (last seen {last_seen.isoformat() if hasattr(last_seen, 'isoformat') else last_seen}).")
+                socketio.start_background_task(monitor)
+    threading.Thread(target=monitor, daemon=True).start()
+
+
+_start_stale_client_monitor()
 
 # -----------------------------
 # Mediapipe setup
@@ -103,24 +147,32 @@ def reverseCalculateScore(low: int, high: int, actual: int):
 @socketio.on("connect")
 def handle_connect():
     sid = request.sid
+    now = utc_now()
     state_manager.init_state(sid)
-    print(f"[CONNECT] User {sid} connected.")
+    state_manager.update_state(sid, {"connect_time": now, "last_seen": now, "disconnect_time": None})
+    print(f"[CONNECT] User {sid} connected at {now.isoformat()}.")
 
 @socketio.on("disconnect")
 def handle_disconnect():
     sid = request.sid
+    now = utc_now()
+    state_manager.update_state(sid, {"disconnect_time": now})
     state_manager.remove_state(sid)
-    print(f"[DISCONNECT] User {sid} disconnected.")
+    print(f"[DISCONNECT] User {sid} disconnected at {now.isoformat()}.")
 
 @socketio.on("frame")
 def process_frame(data):
     sid = request.sid
     state = state_manager.get_state(sid)
     if not state:
+        print(f"[FRAME DEBUG] No state found for sid={sid}")
         return
+
+    state_manager.update_state(sid, {"last_seen": utc_now()})
 
     img_data = data.get("image")
     if not img_data:
+        print(f"[FRAME DEBUG] No image data received for sid={sid}")
         emit("update", {"error": "No image data"}, to=sid)
         return
 
@@ -130,14 +182,21 @@ def process_frame(data):
     np_arr = np.frombuffer(base64.b64decode(img_data), np.uint8)
     frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
     if frame is None:
+        print(f"[FRAME DEBUG] Could not decode frame for sid={sid}")
         emit("update", {"error": "Could not decode frame"}, to=sid)
         return
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = pose.process(rgb)
 
-    if not results.pose_landmarks or not is_pose_visible(results.pose_landmarks.landmark):
+    if not results.pose_landmarks:
+        print(f"[FRAME DEBUG] No pose landmarks detected for sid={sid}")
         return
+    if not is_pose_visible(results.pose_landmarks.landmark):
+        print(f"[FRAME DEBUG] Pose not visible enough for sid={sid}")
+        return
+
+    print(f"[FRAME DEBUG] Processing frame for sid={sid}, exercise={state.get('exercise')}, rep_stage={state.get('rep_stage')}, rep_count={state.get('rep_count')}")
 
     landmarks = results.pose_landmarks.landmark
     angles = extract_joint_angles(landmarks)
@@ -146,8 +205,13 @@ def process_frame(data):
     # Squats
     # ------------------------
     if state["exercise"] == "Squats":
+
         knee = min(angles["knee_l"], angles["knee_r"])
 
+        if state["rep_stage"] is None:
+            state["rep_stage"] = "up"
+            state["min_knee_angle"] = knee
+            return
         if state["rep_stage"] != "down" and knee <= 110:
             state["rep_stage"] = "down"
             state["min_knee_angle"] = knee
@@ -170,12 +234,16 @@ def process_frame(data):
                 feedback = "Bad squat, go lower"
 
             state["rep_scores"].append(score)
+            timestamp = record_rep_event(state, "Squats", state["rep_count"], score, feedback)
+
+            print(f"[REP COUNTED] Squats - sid={sid}, rep={state['rep_count']}, score={int(score)}, feedback={feedback}, timestamp={timestamp}")
 
             emit("update", {
                 "exercise": "Squats",
                 "rep_count": state["rep_count"],
                 "score": int(score),
-                "feedback": feedback
+                "feedback": feedback,
+                "timestamp": timestamp,
             }, to=sid)
 
 
@@ -184,6 +252,10 @@ def process_frame(data):
     # ------------------------
     elif state["exercise"] == "Push-ups":
         elbow_angle = min(angles["elbow_l"], angles["elbow_r"])
+        if state["rep_stage"] is None:
+            state["rep_stage"] = "up"
+            state["min_elbow_angle"] = elbow_angle
+            return
 
         if state["rep_stage"] != "down" and elbow_angle <= 90:
             state["rep_stage"] = "down"
@@ -209,12 +281,16 @@ def process_frame(data):
                 score = 50
 
             state["rep_scores"].append(score)
+            timestamp = record_rep_event(state, "Push-ups", state["rep_count"], score, feedback)
+
+            print(f"[REP COUNTED] Push-ups - sid={sid}, rep={state['rep_count']}, score={int(score)}, feedback={feedback}, timestamp={timestamp}")
 
             emit("update", {
                 "exercise": "Push-ups",
                 "rep_count": state["rep_count"],
                 "score": int(score),
-                "feedback": feedback
+                "feedback": feedback,
+                "timestamp": timestamp,
             }, to=sid)
 
     # ------------------------
@@ -236,6 +312,12 @@ def process_frame(data):
         state["max_knee_dist"] = max(state["max_knee_dist"], knee_dist)
         state["min_knee_dist"] = min(state["min_knee_dist"], knee_dist)
 
+        if state["rep_stage"] is None:
+            state["rep_stage"] = "down"
+            state["max_knee_dist"] = knee_dist
+            state["min_knee_dist"] = knee_dist
+            return
+
         if hand_height < UP_THRESHOLD and state["rep_stage"] != "up":
             state["rep_stage"] = "up"
         elif hand_height > DOWN_THRESHOLD and state["rep_stage"] == "up":
@@ -254,6 +336,9 @@ def process_frame(data):
                 feedback = "Very shallow form"
 
             state["rep_scores"].append(score)
+            timestamp = record_rep_event(state, "Jumping Jacks", state["rep_count"], score, feedback)
+
+            print(f"[REP COUNTED] Jumping Jacks - sid={sid}, rep={state['rep_count']}, score={int(score)}, feedback={feedback}, timestamp={timestamp}")
 
             # Reset knee distances
             state["max_knee_dist"] = 0
@@ -263,7 +348,8 @@ def process_frame(data):
                 "exercise": "Jumping Jacks",
                 "rep_count": state["rep_count"],
                 "score": int(score),
-                "feedback": feedback
+                "feedback": feedback,
+                "timestamp": timestamp,
             }, to=sid)
 
 
@@ -288,6 +374,10 @@ def process_frame(data):
                                       landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value])
         knee_used = min(left_knee_angle, right_knee_angle)
 
+        if state["rep_stage"] is None:
+            state["rep_stage"] = "up"
+            state["min_knee_angle"] = knee_used
+            return
         if state["rep_stage"] != "down" and knee_used < 120:
             state["rep_stage"] = "down"
             state["min_knee_angle"] = knee_used
@@ -308,26 +398,31 @@ def process_frame(data):
                 feedback = "Very shallow lunge"
 
             state["rep_scores"].append(score)
+            timestamp = record_rep_event(state, "Lunges", state["rep_count"], score, feedback)
+
+            print(f"[REP COUNTED] Lunges - sid={sid}, rep={state['rep_count']}, score={int(score)}, feedback={feedback}, timestamp={timestamp}")
 
             emit("update", {
                 "exercise": "Lunges",
                 "rep_count": state["rep_count"],
                 "score": int(score),
-                "feedback": feedback
+                "feedback": feedback,
+                "timestamp": timestamp,
             }, to=sid)
-
-    # Update state at end of processing
-    state_manager.update_state(sid, state)
 
 @socketio.on("set_exercise")
 def set_exercise(data):
     sid = request.sid
     state = state_manager.get_state(sid)
     if not state:
+        print(f"[SET_EXERCISE DEBUG] No state found for sid={sid}")
         return
 
     exercise = data.get("exercise")
+    print(f"[SET_EXERCISE DEBUG] User {sid} setting exercise to '{exercise}'")
+
     if exercise not in ["Push-ups", "Jumping Jacks", "Squats", "Lunges"]:
+        print(f"[SET_EXERCISE DEBUG] Invalid exercise '{exercise}' for sid={sid}")
         emit("set_exercise_response", {"success": False, "error": "Invalid exercise"}, to=sid)
         return
 
@@ -337,10 +432,15 @@ def set_exercise(data):
         "rep_stage": None,
         "frame_scores": [],
         "rep_scores": [],
+        "rep_events": [],
         "min_knee_angle": 180,
-        "min_elbow_angle": 180
+        "min_elbow_angle": 180,
+        "max_knee_dist": 0,
+        "min_knee_dist": 1,
     })
+
     state_manager.update_state(sid, state)
+    print(f"[SET_EXERCISE DEBUG] Exercise set successfully for sid={sid}: {exercise}")
     emit("set_exercise_response", {"success": True, "exercise": exercise}, to=sid)
 
 if __name__ == "__main__":

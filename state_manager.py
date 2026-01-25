@@ -1,3 +1,6 @@
+import datetime
+
+
 class StateManager:
     def __init__(self):
         self.states = {}
@@ -9,10 +12,15 @@ class StateManager:
             "rep_stage": None,
             "frame_scores": [],
             "rep_scores": [],
+            "rep_events": [],
             "min_knee_angle": 180,
             "min_elbow_angle": 180,
             "max_knee_dist": 0,
-            "min_knee_dist": 1
+            "min_knee_dist": 1,
+            # Connection metadata
+            "connect_time": datetime.datetime.now(datetime.timezone.utc),
+            "last_seen": datetime.datetime.now(datetime.timezone.utc),
+            "disconnect_time": None,
         }
 
     def get_state(self, sid):
