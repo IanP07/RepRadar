@@ -12,15 +12,23 @@ interface CameraViewProps {
   onStop: (results: WorkoutResults) => void;
 }
 
+
 export default function CameraView({ exercise, onStop }: CameraViewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const socketRef = useRef<Socket | null>(null);
+  const socketConnectedRef = useRef(false);
+  const exerciseRef = useRef(exercise);
   const poseRef = useRef<Pose | null>(null);
   const poseResultsRef = useRef<any | null>(null);
   const isFlippingRef = useRef(false);
   const poseErroredRef = useRef(false);
   const lastRepCountRef = useRef(0);
+
+  // Keep exerciseRef in sync with exercise prop
+  useEffect(() => {
+    exerciseRef.current = exercise;
+  }, [exercise]);
 
   const [repCount, setRepCount] = useState(0);
   const [currentScore, setCurrentScore] = useState(100);
@@ -30,6 +38,7 @@ export default function CameraView({ exercise, onStop }: CameraViewProps) {
   const [cameraEnabled, setCameraEnabled] = useState(false);
   const [mirrorVideo, setMirrorVideo] = useState(false);
   const [feedback, updateFeedback] = useState<string | null>(null);
+  const [socketConnected, setSocketConnected] = useState(false);
   const cookies = new Cookies();
   const [cookieCamEnabled, setCookieCamEnabled] = useState<boolean>(()=>{
     return cookies.get("cameraEnabled") === true;
@@ -154,21 +163,76 @@ export default function CameraView({ exercise, onStop }: CameraViewProps) {
   useEffect(() => {
     if (!cameraEnabled) return;
 
-    const socket = io(
-      "https://shameka-unbridgeable-noncausally.ngrok-free.dev/",
-      {
-        transports: ["websocket"],
-      }
-    );
+    // Static ngrok domain provided by user
+    const baseUrl = "https://shameka-unbridgeable-noncausally.ngrok-free.dev";
+
+    console.log("[Socket] Attempting connection to:", baseUrl);
+
+    const socket = io(baseUrl, {
+  transports: ["websocket"],
+  upgrade: false,
+  reconnection: true,
+  reconnectionAttempts: Infinity,
+  reconnectionDelay: 1000,
+});
+
 
     socketRef.current = socket;
 
     socket.on("connect", () => {
-      console.log("Socket connected, sending exercise");
+      console.log("[Socket] Connected");
+      socketConnectedRef.current = true;
+      setSocketConnected(true);
       sendExercise();
     });
 
-    socket.on("disconnect", () => console.log("Socket.IO disconnected"));
+    socket.on("connected", (_data) => {
+      console.log("[Socket] Server confirmed connection");
+    });
+
+    socket.io.engine.on("upgrade", (_transport) => {
+      // Upgraded to websocket
+    });
+
+    socket.io.engine.on("upgradeError", (_error) => {
+      // Upgrade error - will continue with polling
+    });
+
+    socket.io.engine.on("open", () => {
+      // Engine IO connection opened
+    });
+
+    socket.io.engine.on("close", (_reason) => {
+      // Engine IO connection closed
+    });
+
+    socket.on("disconnect", (reason) => {
+      console.log("[Socket] Disconnected:", reason);
+      socketConnectedRef.current = false;
+      setSocketConnected(false);
+    });
+
+    socket.on("connect_error", (error) => {
+      console.error("[Socket] Connection error:", error.message);
+      socketConnectedRef.current = false;
+      setSocketConnected(false);
+    });
+
+    socket.on("error", (error) => {
+      console.error("[Socket] Error:", error);
+      socketConnectedRef.current = false;
+      setSocketConnected(false);
+    });
+
+    socket.on("reconnect_attempt", (_attempt) => {
+      // Reconnection attempt
+    });
+
+    socket.on("reconnect_failed", () => {
+      console.error("[Socket] Reconnection failed");
+      socketConnectedRef.current = false;
+      setSocketConnected(false);
+    });
 
     socket.on("analysis", (data: any) => {
       if (data.repCount !== undefined) setRepCount(data.repCount);
@@ -177,11 +241,7 @@ export default function CameraView({ exercise, onStop }: CameraViewProps) {
 
     // Getting data from backend
     socket.on("update", (data) => {
-      console.log("Rep count:", data.rep_count);
-      console.log("Score:", data.score);
-      console.log("Feedback:", data.feedback);
-      console.log("Exercise:", data.exercise);
-
+      console.log("[Socket] Received update:", data);
       // Update your UI
       setRepCount(data.rep_count);
       setCurrentScore(data.score);
@@ -207,7 +267,10 @@ export default function CameraView({ exercise, onStop }: CameraViewProps) {
     });
 
     return () => {
+      socketConnectedRef.current = false;
+      setSocketConnected(false);
       socket.disconnect();
+      socketRef.current = null;
     };
   }, [cameraEnabled]);
 
@@ -277,7 +340,7 @@ export default function CameraView({ exercise, onStop }: CameraViewProps) {
 
         const base64 = canvas.toDataURL("image/jpeg", 0.7);
 
-        if (socketRef.current) {
+        if (socketRef.current && socketConnectedRef.current) {
           socketRef.current.emit("frame", { image: base64 });
         }
       }
@@ -301,12 +364,12 @@ export default function CameraView({ exercise, onStop }: CameraViewProps) {
   const sendExercise = () => {
     if (!socketRef.current) return;
 
-    // Small JSON object
-    const data = { exercise: exercise };
+    // Use ref to get current exercise value
+    const data = { exercise: exerciseRef.current };
 
     // Emit to server
     socketRef.current.emit("set_exercise", data);
-    console.log("Sent packet");
+    console.log("Sent exercise:", exerciseRef.current);
   };
 
   // ---------------------- DEMO MODE ----------------------
@@ -440,6 +503,18 @@ export default function CameraView({ exercise, onStop }: CameraViewProps) {
         <div className="stat-item">
           <span className="stat-label">Current Score</span>
           <span className="stat-value">{currentScore}</span>
+        </div>
+        <div className="stat-item">
+          <span className="stat-label">Socket Status</span>
+          <span
+            className="stat-value"
+            style={{
+              color: socketConnected ? "#22c55e" : "#ef4444",
+              fontSize: "12px"
+            }}
+          >
+            {socketConnected ? "✓ Connected" : "✗ Disconnected"}
+          </span>
         </div>
       </div>
 

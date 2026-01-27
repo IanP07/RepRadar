@@ -1,0 +1,7 @@
+opencv-python==4.7.0.72
+numpy==1.24.3
+mediapipe==0.10.21
+Flask==3.1.2
+Flask-SocketIO==5.5.1
+Flask-Cors>=4.0.0
+eventlet>=0.33.0
