@@ -40,6 +40,32 @@ class ConnectionManager:
         self.active_connections: Dict[str, WebSocket] = {}
 
     async def connect(self, sid: str, websocket: WebSocket):
+        # Try to extract as much debug info as possible from the websocket scope/headers
+        try:
+            scope = getattr(websocket, "scope", {})
+            path = scope.get("path") if isinstance(scope, dict) else None
+            query_string = scope.get("query_string") if isinstance(scope, dict) else None
+            headers = {}
+            try:
+                for k, v in websocket.headers.items():
+                    headers[k.decode() if isinstance(k, bytes) else k] = v.decode() if isinstance(v, bytes) else v
+            except Exception:
+                # starlette headers behaves like a multidict; fallback to raw scope headers
+                try:
+                    raw_headers = scope.get("headers", [])
+                    for k, v in raw_headers:
+                        headers[k.decode()] = v.decode()
+                except Exception:
+                    headers = {}
+
+            origin = headers.get("origin") or headers.get("host")
+            ua = headers.get("user-agent")
+            client_info = getattr(websocket, "client", None)
+
+            print(f"[WS HANDSHAKE] incoming sid={sid}, path={path}, query={query_string}, origin={origin}, user_agent={ua}, client={client_info}")
+        except Exception as e:
+            print(f"[WS HANDSHAKE ERROR] Could not read handshake info for {sid}: {e}")
+
         await websocket.accept()
         self.active_connections[sid] = websocket
         # Debug log with timestamp, user id, remote client (if available), and active count
@@ -383,18 +409,20 @@ async def handle_pushups(client_id: str, state: dict, angles: dict):
         state["rep_stage"] = "up"
         state["rep_count"] += 1
 
+        score = reverseCalculateScore(
+            low=70,  # deep push-up
+            high=100,  # shallow push-up
+            actual=state["min_elbow_angle"]
+        )
+
         if state["min_elbow_angle"] <= 70:
+            feedback = "Great push-up"
+        elif state["min_elbow_angle"] <= 85:
             feedback = "Good push-up"
-            score = 100
-        elif state["min_elbow_angle"] <= 80:
-            feedback = "Decent push-up"
-            score = 80
         elif state["min_elbow_angle"] <= 100:
-            feedback = "Mediocre push-up"
-            score = 60
+            feedback = "Shallow push-up"
         else:
-            feedback = "Poor push-up"
-            score = 50
+            feedback = "Very shallow push-up"
 
         state["rep_scores"].append(score)
         timestamp = record_rep_event(state, "Push-ups", state["rep_count"], score, feedback)
@@ -583,6 +611,5 @@ async def health_check():
 # Run server
 # ==========================================
 if __name__ == "__main__":
-    print("Starting AI Exercise Form Checker on port 8000....")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
+    print("Starting AI Exercise Form Checker on port 5032...")
+    uvicorn.run(app, host="0.0.0.0", port=5032)
