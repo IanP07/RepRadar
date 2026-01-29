@@ -1,15 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import type { Exercise, WorkoutResults, RepResult } from "../types";
 import "./CameraView.css";
-import { io, Socket } from "socket.io-client";
 import { Pose, POSE_CONNECTIONS } from "@mediapipe/pose";
 // @ts-ignore - drawing_utils has no TypeScript types
 import * as drawingUtils from "@mediapipe/drawing_utils";
 import { Cookies } from 'react-cookie'
-
-const SOCKET_URL =
-  (import.meta as any)?.env?.VITE_SOCKET_URL ||
-  "https://shameka-unbridgeable-noncausally.ngrok-free.dev/";
 
 interface CameraViewProps {
   exercise: Exercise;
@@ -19,7 +14,7 @@ interface CameraViewProps {
 export default function CameraView({ exercise, onStop }: CameraViewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const socketRef = useRef<Socket | null>(null);
+  const websocketRef = useRef<WebSocket | null>(null);
   const poseRef = useRef<Pose | null>(null);
   const poseResultsRef = useRef<any | null>(null);
   const isFlippingRef = useRef(false);
@@ -34,6 +29,11 @@ export default function CameraView({ exercise, onStop }: CameraViewProps) {
   const [cameraEnabled, setCameraEnabled] = useState(false);
   const [mirrorVideo, setMirrorVideo] = useState(false);
   const [feedback, updateFeedback] = useState<string | null>(null);
+  // Connection debug state
+  const [connectionStatus, setConnectionStatus] = useState<string>("Disconnected");
+  const [debugWsUrl, setDebugWsUrl] = useState<string | null>(null);
+  const [debugClientId, setDebugClientId] = useState<string | null>(null);
+  const [lastWsError, setLastWsError] = useState<string | null>(null);
   const cookies = new Cookies();
   const [cookieCamEnabled, setCookieCamEnabled] = useState<boolean>(()=>{
     return cookies.get("cameraEnabled") === true;
@@ -154,64 +154,134 @@ export default function CameraView({ exercise, onStop }: CameraViewProps) {
     };
   }, [cameraEnabled, facingMode]); // facingMode triggers re-initialization
 
-  // ---------------------- SOCKET.IO SETUP ----------------------
+  // ---------------------- WEBSOCKET SETUP ----------------------
   useEffect(() => {
     if (!cameraEnabled) return;
 
-    const socket = io(
-      SOCKET_URL,
-      {
-        transports: ["websocket"],
+    // Generate a unique client ID for this session
+    const clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // Resolve WebSocket URL. Support full URL via VITE_SOCKET_URL (ws://... or wss://...),
+    // or host via VITE_SOCKET_HOST. Default to the static ngrok URL provided by the user.
+    const env = (import.meta as any)?.env || {};
+    const DEFAULT_HOST = "https://shameka-unbridgeable-noncausally.ngrok-free.dev";
+    const configuredUrl = env.VITE_SOCKET_URL || env.VITE_SOCKET_HOST || DEFAULT_HOST;
+    let wsUrl: string;
+
+    if (configuredUrl) {
+      const trimmed = configuredUrl.replace(/\/$/, "");
+      // If it already contains ws:// or wss://, use as-is
+      if (/^wss?:\/\//i.test(trimmed)) {
+        wsUrl = `${trimmed}/ws/${clientId}`;
       }
-    );
+      // If it contains http:// or https://, convert to ws/wss
+      else if (/^https?:\/\//i.test(trimmed)) {
+        const scheme = trimmed.startsWith("https:") ? "wss:" : "ws:";
+        // remove protocol
+        const hostOnly = trimmed.replace(/^https?:\/\//i, "");
+        wsUrl = `${scheme}//${hostOnly}/ws/${clientId}`;
+      }
+      // Otherwise treat as host (host[:port])
+      else {
+        const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+        wsUrl = `${scheme}//${trimmed}/ws/${clientId}`;
+      }
+    } else {
+      const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+      wsUrl = `${scheme}//${window.location.host}/ws/${clientId}`;
+    }
 
-    socketRef.current = socket;
+    console.log("Using WebSocket URL:", wsUrl);
 
-    socket.on("connect", () => {
-      console.log("Socket connected, sending exercise");
+    // expose debug info to the UI
+    try { setDebugWsUrl(wsUrl); setDebugClientId(clientId); } catch(e){}
+
+    // reflect that we're attempting to connect
+    setConnectionStatus("Connecting");
+
+    const ws = new WebSocket(wsUrl);
+    // expose websocket reference immediately
+    websocketRef.current = ws;
+
+    ws.onopen = () => {
+      console.log("WebSocket connected");
+      setConnectionStatus("Connected");
+      setLastWsError(null);
       sendExercise();
-    });
+    };
 
-    socket.on("disconnect", () => console.log("Socket.IO disconnected"));
+    ws.onclose = (ev) => {
+      console.log("WebSocket disconnected", ev);
+      setConnectionStatus("Disconnected");
+      websocketRef.current = null;
+      try { setLastWsError(`Close code=${(ev as any)?.code} reason=${(ev as any)?.reason}`); } catch(e){}
+    };
 
-    socket.on("analysis", (data: any) => {
-      if (data.repCount !== undefined) setRepCount(data.repCount);
-      if (data.score !== undefined) setCurrentScore(data.score);
-    });
+    ws.onerror = (error) => {
+      console.error("WebSocket error:", error);
+      setConnectionStatus("Error");
+      try { setLastWsError(String(error)); } catch(e){}
+    };
 
-    // Getting data from backend
-    socket.on("update", (data) => {
-      console.log("Rep count:", data.rep_count);
-      console.log("Score:", data.score);
-      console.log("Feedback:", data.feedback);
-      console.log("Exercise:", data.exercise);
+    ws.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        const { event: eventType, data } = message;
 
-      // Update your UI
-      setRepCount(data.rep_count);
-      setCurrentScore(data.score);
-      updateFeedback(data.feedback);
+        if (eventType === "update") {
+          console.log("Rep count:", data.rep_count);
+          console.log("Score:", data.score);
+          console.log("Feedback:", data.feedback);
+          console.log("Exercise:", data.exercise);
 
-      if (
-        typeof data.rep_count === "number" &&
-        data.rep_count > lastRepCountRef.current
-      ) {
-        lastRepCountRef.current = data.rep_count;
+          // Update your UI
+          setRepCount(data.rep_count);
+          setCurrentScore(data.score);
+          updateFeedback(data.feedback);
 
-        repDataRef.current.push({
-          repNumber: data.rep_count,
-          // assume backend sends 0–1 or 0–100; normalize if needed
-          score: typeof data.score === "number" ? data.score : 0,
-          notes: data.feedback
-            ? Array.isArray(data.feedback)
-              ? data.feedback
-              : [data.feedback]
-            : [],
-        });
+          if (
+            typeof data.rep_count === "number" &&
+            data.rep_count > lastRepCountRef.current
+          ) {
+            lastRepCountRef.current = data.rep_count;
+
+            repDataRef.current.push({
+              repNumber: data.rep_count,
+              score: typeof data.score === "number" ? data.score : 0,
+              notes: data.feedback
+                ? Array.isArray(data.feedback)
+                  ? data.feedback
+                  : [data.feedback]
+                : [],
+            });
+          }
+        } else if (eventType === "set_exercise_response") {
+          console.log("Exercise set response:", data);
+          // server acknowledged our set_exercise — mark connection confirmed
+          if (data && data.success) {
+            setConnectionStatus("Connected");
+            setLastWsError(null);
+          } else {
+            setConnectionStatus("Error");
+            try { setLastWsError(data && data.error ? String(data.error) : "set_exercise failed"); } catch(e){}
+          }
+        } else if (eventType === "error") {
+          console.error("Server error:", data.error);
+          setConnectionStatus("Error");
+          try { setLastWsError(data && data.error ? String(data.error) : null); } catch(e){}
+        }
+      } catch (error) {
+        console.error("Error parsing WebSocket message:", error);
       }
-    });
+    };
 
     return () => {
-      socket.disconnect();
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
+      // Reset connection status on cleanup
+      setConnectionStatus("Disconnected");
+      websocketRef.current = null;
     };
   }, [cameraEnabled]);
 
@@ -281,8 +351,12 @@ export default function CameraView({ exercise, onStop }: CameraViewProps) {
 
         const base64 = canvas.toDataURL("image/jpeg", 0.7);
 
-        if (socketRef.current) {
-          socketRef.current.emit("frame", { image: base64 });
+        if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+          const message = {
+            event: "frame",
+            data: { image: base64 }
+          };
+          websocketRef.current.send(JSON.stringify(message));
         }
       }
 
@@ -303,14 +377,15 @@ export default function CameraView({ exercise, onStop }: CameraViewProps) {
 
   // ---------------------- Sends Exercise ----------------------
   const sendExercise = () => {
-    if (!socketRef.current) return;
+    if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) return;
 
-    // Small JSON object
-    const data = { exercise: exercise };
+    const message = {
+      event: "set_exercise",
+      data: { exercise: exercise }
+    };
 
-    // Emit to server
-    socketRef.current.emit("set_exercise", data);
-    console.log("Sent packet");
+    websocketRef.current.send(JSON.stringify(message));
+    console.log("Sent exercise:", exercise);
   };
 
   // ---------------------- DEMO MODE ----------------------
@@ -427,6 +502,13 @@ export default function CameraView({ exercise, onStop }: CameraViewProps) {
       </div>
 
       {/* Stats */}
+      {/* Connection Debug Panel */}
+      <div className="connection-status" style={{ textAlign: "center", margin: "10px 0" }}>
+        <div style={{fontWeight:600}}>Socket: {connectionStatus}</div>
+        {debugWsUrl && <div style={{fontSize:12, color:'#666'}}>WS URL: {debugWsUrl}</div>}
+        {debugClientId && <div style={{fontSize:12, color:'#666'}}>Client ID: {debugClientId}</div>}
+        {lastWsError && <div style={{fontSize:12, color:'crimson'}}>Last Error: {lastWsError}</div>}
+      </div>
       <div className="stat-item">
         <span
           className="stat-value"
